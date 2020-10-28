@@ -1,0 +1,13 @@
+{
+    "voice": "en-AU-Catherine",
+    "map": [
+        {
+            "key": "Panda",
+            "value": "Panda"
+        },
+        {
+            "key": "Lion",
+            "value": "Lion"
+        }
+    ]
+}

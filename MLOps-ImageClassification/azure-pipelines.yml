@@ -1,0 +1,182 @@
+trigger:
+  branches:
+    include:
+      - master
+  paths:
+    include:
+    - MLOps-ImageClassification/Animals/*
+
+pool: 
+   vmImage: ubuntu-latest
+
+variables:
+- group: credentials
+
+stages:
+
+- stage: 'Training'
+  displayName: 'Train Models'
+
+  jobs:
+  - job: 'Create_Train_Models'
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+         versionSpec: '$(python.version)'
+      displayName: 'Use Python $(python.version)'
+
+    # - task: Bash@3
+    #   displayName: Install azcopy
+    #   inputs:
+    #     targetType: 'inline'
+    #     script: |
+    #       curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+    #       mkdir $(Agent.ToolsDirectory)/azcopy
+    #       wget -O $(Agent.ToolsDirectory)/azcopy/azcopy_v10.tar.gz https://aka.ms/downloadazcopy-v10-linux
+    #       tar -xf $(Agent.ToolsDirectory)/azcopy/azcopy_v10.tar.gz -C $(Agent.ToolsDirectory)/azcopy --strip-components=1
+
+    # - task: AzureCLI@2
+    #   displayName: Download images azcopy
+    #   inputs:
+    #     azureSubscription: 'IoTHub'
+    #     scriptType: 'bash'
+    #     scriptLocation: 'inlineScript'
+    #     inlineScript: |
+    #       $(Agent.ToolsDirectory)/azcopy/azcopy cp "$(BLOBPATH)" "$(Build.SourcesDirectory)/MLOps-ImageClassification/" --recursive
+    #       ls Animals/Panda
+    #     workingDirectory: $(Build.SourcesDirectory)/MLOps-ImageClassification
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        echo $RESOURCE
+      displayName: 'Install dependencies and Linting'
+      workingDirectory: $(Build.SourcesDirectory)/MLOps-ImageClassification
+
+    - script: |
+          export ENDPOINT=$(ENDPOINT)
+          export KEY=$(KEY)
+          export IMAGES=$(IMAGES)
+          export PROJECT=$(PROJECT)
+          export RESOURCE=$(RESOURCE)
+          python CreateModel.py
+      displayName: 'Model Training'
+      workingDirectory: $(Build.SourcesDirectory)/MLOps-ImageClassification
+
+    - script:  |
+          url=$(cat modelurl.txt)
+          wget -O $(Build.ArtifactStagingDirectory)/dockerarmmodel.zip "$url"
+          unzip  $(Build.ArtifactStagingDirectory)/dockerarmmodel.zip -d  $(Build.ArtifactStagingDirectory)/temp
+      displayName: 'Download Models from Azure CustomVision'
+      workingDirectory: $(Build.SourcesDirectory)/MLOps-ImageClassification
+      
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'Models'
+        publishLocation: 'Container'
+    
+- stage: 'Build_Push_IoTModules'
+  dependsOn: Training
+  displayName: 'Build and Push IoT Modules'
+  pool: Default
+
+
+  jobs:
+  - job: 'Build_Modules'
+    steps:
+
+    - task: DownloadBuildArtifacts@0
+      inputs:
+        buildType: 'current'
+        downloadType: 'specific'
+        downloadPath: '$(Build.ArtifactStagingDirectory)'
+
+    - script: |
+           cp temp/app/model.pb temp/app/labels.txt $(Build.SourcesDirectory)/MLOps-IoTModules/IoT-Modules/modules/ImageClassifierService/app
+           echo "Copying complete"
+           
+      displayName: 'Copy new model to IoT Module'
+      workingDirectory: '$(Build.ArtifactStagingDirectory)/Models'
+    
+    - task: replacetokens@3
+      inputs:
+        rootDirectory: 'MLOps-IoTModules/IoT-Modules'
+        targetFiles: 'deployment.template.json'
+        encoding: 'auto'
+        writeBOM: true
+        actionOnMissing: 'warn'
+        keepToken: false
+        tokenPrefix: '#{'
+        tokenSuffix: '}#'
+        useLegacyPattern: false
+        enableTelemetry: false
+      displayName: 'Replace Deployment Template Tokens'
+      
+    
+    - task: replacetokens@3
+      inputs:
+        rootDirectory: 'MLOps-IoTModules/IoT-Modules'
+        targetFiles: 'modules/**/module.json'
+        encoding: 'auto'
+        writeBOM: true
+        actionOnMissing: 'warn'
+        keepToken: false
+        tokenPrefix: '#{'
+        tokenSuffix: '}#'
+        useLegacyPattern: false
+        enableTelemetry: false
+      displayName: 'Replace IoT Modules Tokens'
+    
+    - task: AzureIoTEdge@2
+      inputs:
+        action: 'Push module images'
+        containerregistrytype: 'Generic Container Registry'
+        dockerRegistryConnection: 'DockerHub'
+        templateFilePath: 'MLOps-IoTModules/IoT-Modules/deployment.template.json'
+        defaultPlatform: 'arm32v7'
+        fillRegistryCredential: 'false'
+      displayName: 'Push Images to Container Registry'
+
+    - task: AzureIoTEdge@2
+      inputs:
+        action: 'Generate deployment manifest'
+        templateFilePath: 'MLOps-IoTModules/IoT-Modules/deployment.template.json'
+        defaultPlatform: 'arm32v7'
+        deploymentManifestOutputPath: '$(Build.ArtifactStagingDirectory)/Manifests/deployment.json'
+        validateGeneratedDeploymentManifest: 'false'
+      displayName: 'Generate Deployment Manifests'
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/Manifests'
+        ArtifactName: 'deploymentmanifest'
+        publishLocation: 'Container'
+
+- stage: 'Deploy_Modules'
+  dependsOn: Build_Push_IoTModules
+  displayName: 'Deploy Modules to Edge Devices'
+  pool: Default
+
+  jobs:
+    - job: 'Deploy_Modules'
+      steps:
+      - task: DownloadBuildArtifacts@0
+        inputs:
+          buildType: 'current'
+          downloadType: 'single'
+          artifactName: 'Deploymentmanifest'
+          downloadPath: '$(Build.ArtifactStagingDirectory)'
+      
+      - task: AzureIoTEdge@2
+        inputs:
+          action: 'Deploy to IoT Edge devices'
+          deploymentFilePath: '$(Build.ArtifactStagingDirectory)/deploymentmanifest/deployment.json'
+          azureSubscription: 'IoTHub'
+          iothubname: 'mlops-iothub'
+          deploymentid: '$(System.TeamProject)-devops-deployment'
+          priority: '0'
+          deviceOption: 'Single Device'
+          deviceId: 'raspi-master'
+      
+        
